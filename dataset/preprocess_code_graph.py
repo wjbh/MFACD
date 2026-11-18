@@ -1,0 +1,136 @@
+import os
+import sys
+import pickle
+import traceback
+from typing import Dict, List, Optional
+
+import polars as pl
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+try:
+    from dataset.impl.Exceptions import KnownException
+    from dataset.impl.JavaCodeGraphExtractor import JavaCodeGraphExtractor
+    from config import ProjectConfig, ProjectConst
+except ImportError:
+    from dataset.impl.Exceptions import KnownException
+    from dataset.impl.JavaCodeGraphExtractor import JavaCodeGraphExtractor
+    from config import ProjectConfig, ProjectConst
+
+max_workers = 8
+
+
+def _extract_graph(code: Optional[str], extractor_cls):
+    if code is None:
+        return None
+    if not isinstance(code, str):
+        code = str(code)
+    code = code.strip()
+    if not code:
+        return None
+    try:
+        return extractor_cls(code).get_ast_feature()  # networkx
+    except KnownException:
+        return None
+    except Exception:
+        return None
+
+
+def process_batch_for_type(batch_rows: List[dict], extractor_cls) -> Dict[str, object]:
+    """
+    batch_rows: [{"id": ..., "code": ...}, ...]
+    """
+    out: Dict[str, object] = {}
+    for r in batch_rows:
+        _id = r.get("id")
+        out[_id] = _extract_graph(r.get("code"), extractor_cls)
+    return out
+
+
+def _sanitize_type(t: str) -> str:
+
+    if t is None:
+        return "unk"
+    t = str(t).strip()
+    if not t:
+        return "unk"
+    safe = []
+    for ch in t:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe)
+
+
+def run_exported_parquet(lang: str, parquet_path: str, split_name: str, *, batch_size: int = 256):
+    extractor_cls = JavaCodeGraphExtractor if lang == "java" else None
+    if extractor_cls is None:
+        raise ValueError(f"Unsupported language: {lang}")
+
+    print(f"Building graphs for {parquet_path}")
+    df = pl.read_parquet(parquet_path)
+
+
+    required = {"id", "type", "code"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required column(s): {sorted(missing)}")
+
+    out_dir = ProjectConfig.path_compiled_dataset
+    os.makedirs(out_dir, exist_ok=True)
+
+
+    types = df.select(pl.col("type").cast(pl.Utf8)).unique().to_series().to_list()
+    types = [t for t in types if t is not None]
+    types_sorted = sorted(types, key=lambda x: str(x))
+    print(f"Found types ({len(types_sorted)}): {types_sorted[:20]}{'...' if len(types_sorted) > 20 else ''}")
+
+
+    for tval in types_sorted:
+        t_safe = _sanitize_type(tval)
+
+        out_pkl = os.path.join(out_dir, f"{lang}_{split_name}_graph_{t_safe}.pkl")
+        if os.path.exists(out_pkl):
+            os.remove(out_pkl)
+
+
+        sub = df.filter(pl.col("type") == tval).select(["id", "code"])
+
+        rows = sub.to_dicts()
+        total = len(rows)
+        if total == 0:
+            print(f"[skip] type={tval} -> empty")
+            continue
+
+        batches = [rows[i:i + batch_size] for i in range(0, total, batch_size)]
+        result_map: Dict[str, object] = {}
+
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(process_batch_for_type, b, extractor_cls) for b in batches]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"{split_name}:{t_safe}"):
+                try:
+                    result_map.update(fut.result())
+                except Exception as e:
+                    print(f"Future error: {e}")
+                    print(traceback.format_exc())
+
+        with open(out_pkl, "wb") as f:
+            pickle.dump(result_map, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        print(f"Saved: {out_pkl} (type={tval}, items={len(result_map)})")
+
+
+def main():
+    lang = "java"
+    base = f"{ProjectConfig.path_origin_dataset}"
+
+    run_exported_parquet(lang, f"{base}/step1_{lang}_train.parquet", "train")
+    run_exported_parquet(lang, f"{base}/step1_{lang}_val.parquet", "val")
+    run_exported_parquet(lang, f"{base}/step1_{lang}_test.parquet", "test")
+
+
+if __name__ == "__main__":
+    main()
